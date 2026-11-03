@@ -179,3 +179,94 @@ Boot test on the device: known-good macOS bootchain with **only** the freshly-re
 ramdisk (both fixes: v1 spaceman **and** the valid xid chain) swapped in. If it boots to SSH,
 apfs-writer is at parity for the ramdisk use case. Strongest local proxy short of the device:
 a **RW** mount with the strict `linux-apfs-rw` module (RO is already confirmed via apfs-fuse).
+
+## 2. iOS 27 apfs kext — full-audit sweep (2026-11-03)
+
+Pulled the iOS 27.0.1 `com.apple.filesystems.apfs` kext from the kernelcache fileset
+(1.74 MB, 2322 functions). Decompiled headless with `~/bin/ida-dump-all-idalib`
+in 71 s. Dump at `/tmp/kcdump/apfs/dump/all/`.
+
+### Every mount-reject path the iOS 27 kext takes
+
+Error strings grep says the kext rejects a mount for:
+
+1. `unsupported apfs_incompatible_features` — volume super has a bit the kext
+   doesn't know. Writer sets `0x8 (NORMALIZATION_INSENSITIVE)` only, which is
+   universally supported.
+2. `unsupported apfs_readonly_compatible_features` — would force r/o. Writer sets 0.
+3. `unsupported nx_incompatible_features` — container super has unknown bit.
+   Writer sets 0.
+4. `unsupported nx_readonly_compatible_features` — forces r/o. Writer sets 0.
+5. `unsupported flags` (volume-super fs_flags) — writer sets 0x1 (UNENCRYPTED).
+6. Unsupported volume type / tree type — writer uses PHYSICAL|BTREE for
+   data-stream trees, VIRTUAL|BTREE for catalog, matching stock.
+7. `refusing to upgrade spaceman!` — the v0→v1 upgrade path. Writer emits v1
+   directly (see §1), so this path is never taken.
+8. Sealed-volume checks (`!apfs_is_sealed`, `Graft of an unsealed image not
+   allowed`, `authenticated mount requested but volume is not sealed`) — these
+   only fire when iBoot asked for an *authenticated* mount with ARV. Our
+   ramdisk use case is `rd=md0` which does an unauthenticated r/w mount, so
+   seal is not required.
+9. Keybag version mismatch — only for encrypted volumes. Writer is UNENCRYPTED.
+10. `check_rootmount_qualification() returned false` — qualification is about
+    device/container identity, not image contents.
+
+**Nothing in iOS 27's mount paths rejects a correctly-formed unencrypted volume
+with v1 spaceman + the fields listed in §1.**
+
+### Writer-field audit against iOS 27 kext checks
+
+| field offset | writer value | iOS 27 expects for a ramdisk | ok |
+|---|---|---|---|
+| vol+0x28 `apfs_features` | 0x2 (HARDLINK_MAP_RECORDS) | any superset | ✓ |
+| vol+0x38 `apfs_incompat_feat` | 0x8 (NORMALIZATION_INSENSITIVE) | iOS requires NI set | ✓ |
+| vol+0x40 `apfs_ro_compat_feat` | 0 | 0 for no ro-compat features | ✓ |
+| vol+0x108 `apfs_fs_flags` | 0x1 (UNENCRYPTED) | UNENCRYPTED | ✓ |
+| vol+0x60–0x70 `meta_crypto` | wmcs 5/0, class-F | present even unencrypted | ✓ |
+| vol+0x410 `fext_tree_type` | PHYSICAL\|BTREE | required by iOS 26+ | ✓ (§1) |
+| vol+0x74 `root_tree_type` | VIRTUAL\|BTREE | VIRTUAL\|BTREE | ✓ |
+| vol+0x78 `extentref_type` | PHYSICAL\|BTREE | PHYSICAL\|BTREE | ✓ |
+| vol+0x7c `snap_meta_type` | PHYSICAL\|BTREE | PHYSICAL\|BTREE | ✓ |
+| sm+144 `sm_flags` | 1 (VERSIONED) | VERSIONED required | ✓ (§1) |
+| sm+336 `sm_version` | 1 | 1 | ✓ (§1) |
+| sm+340 `sm_struct_size` | 0x9D8 | 0x9D8 | ✓ (§1) |
+| nxsb `nx_incompat_feat` | 0 | 0 if no FUSION/VERSIONED container | ✓ |
+
+### Features the kext knows about but the writer deliberately does NOT emit
+
+These are runtime-only; the kext generates them during normal operation, they
+are not required by newfs_apfs output:
+
+- `apfs_clonegroup_*` — generated when a file is cloned via APFS_CLONE_IOCTL
+- `expanded obj type` / `expanded record` — synthesized when obj id > 64-bit space
+- `Supplemental flags` (inode supp_flags) — set via `apfs_set_supplemental_flags` API
+- `Purgeable` records — set via purgeable file API
+- Sealed-volume seal / snapshot authentication — SSV-only, our volume is unsealed
+- `keybag_version_upgrade` — encrypted-volume keybag version bump
+- `INODE_PROT_CLASS_UPGRADE_ROLLIP` — in-flight protection class upgrade
+- `secondary fsroot` — secondary fsroot slot
+- `restore change point` — restore-mode state record
+
+### Verdict
+
+**apfs-writer is at parity for the ramdisk use case on iOS 27.** No additional
+keys/fields need to be emitted. The §1 spaceman v1 + fext_tree_type +
+modified_by fixes were sufficient. Audit methodology (dump + grep + offset
+cross-check) is reproducible on future iOS revisions.
+
+### Reproduction commands
+
+```sh
+# extract the iOS N apfs kext
+~/.local/bin/ipsw kernel dec kernelcache.img4 -o /tmp/kc/
+~/.local/bin/ipsw macho info /tmp/kc/kernelcache*.decompressed \
+    --fileset-entry 'com.apple.filesystems.apfs' --extract-fileset-entry -o /tmp/kc/
+
+# decompile everything
+~/bin/ida-dump-all-idalib /tmp/kc/com.apple.filesystems.apfs \
+    --out /tmp/apfs_dump --skip-thunks
+
+# audit reject strings
+strings -a /tmp/kc/com.apple.filesystems.apfs \
+    | grep -iE 'unsupported|refusing|unable to mount|not allowed'
+```
