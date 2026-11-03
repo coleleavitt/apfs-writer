@@ -22,6 +22,24 @@ use the library API (`ContainerBuilder`) for real injections.
 Self-check prints `checksummed objects: N ok, 0 bad (of N sealed)` — the exact
 set of objects the builder sealed, each verified over its full length.
 
+## apfs-pack: build a ramdisk from a stock image
+
+```console
+$ apfs-pack --out ramdisk.dmg --size-mb 280 --image stock.dmg --tar ssh.tar.gz [--tar more.tar.gz] [--src dir]
+```
+
+Sources apply in order `--image`, `--src`, `--tar`; later ones override earlier paths.
+`--image` reads the first volume of an unencrypted APFS container with the built-in reader
+(`src/reader.rs`) and copies it as stored: compressed files keep their `com.apple.decmpfs`
+xattr and resource fork (apfs-fuse cannot serve forks over 64 KiB, so copy from the image,
+not from a mount). Owner, mode and mtime are kept; tar and `--src` entries are owned by
+root:root unless `--keep-owner`. Symlinks, directories, regular and compressed files are
+supported; other file types are skipped. Names must be ASCII.
+
+The volume is normalization-insensitive and case-sensitive, like the iOS ramdisk volume.
+Catalog, extent-reference and volume-omap trees are multi-level (`src/tree.rs`).
+Check output with `apfsck -cw` (`-u` reports the real `fpmc` decmpfs signature as unknown).
+
 ## What it builds
 
 - NXSB (container superblock) + checkpoint ring: CPMAP/NXSB descriptor+data pairs

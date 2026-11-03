@@ -2,7 +2,10 @@
 //! Layout, oids, checkpoint semantics and spaceman follow mkapfs exactly;
 //! block checksums follow Apple's newfs_apfs (kuna-verified, 233/233 blocks).
 
-use anyhow::Result;
+use crate::tree::{build_tree, node_count, Rec, TreeSpec};
+use anyhow::{bail, Result};
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub const BLOCK_SIZE: usize = 4096;
 pub const NX_MAGIC: u32 = u32::from_le_bytes(*b"NXSB");
@@ -14,6 +17,7 @@ pub const OBJ_PHYSICAL: u32 = 0x4000_0000;
 
 pub const OBJECT_TYPE_NX_SUPERBLOCK: u32 = 0x01;
 pub const OBJECT_TYPE_BTREE: u32 = 0x02;
+pub const OBJECT_TYPE_BTREE_NODE: u32 = 0x03;
 pub const OBJECT_TYPE_SPACEMAN: u32 = 0x05;
 pub const OBJECT_TYPE_SPACEMAN_CAB: u32 = 0x06;
 pub const OBJECT_TYPE_SPACEMAN_CIB: u32 = 0x07;
@@ -46,6 +50,7 @@ pub const NEXT_OID_AFTER_MKFS: u64 = 1024 + 100;
 
 pub const MKFS_XID: u64 = 1;
 
+/// Dentry hash of a name on a normalization-insensitive, case-sensitive volume. ASCII names only (NFD is the identity there).
 pub fn dentry_hash_standalone(name: &str) -> u32 {
     let mut hash: u32 = 0xFFFFFFFF;
     let table = crc32c_table();
@@ -74,19 +79,30 @@ fn crc32c_table() -> &'static [u32; 256] {
         t
     })
 }
-pub const MKFS_ID: &str = "apfs-writer 0.1";
+// A real iOS volume is formatted by newfs_apfs and then stamped by the kext on first mount.
+// iOS's ramdisk mounter rejects the "formatted but never mounted" shape apfs-writer used to
+// emit (generic formatter id, empty apfs_modified_by), even though it is apfsck-clean, so we
+// present the formatted-and-mounted shape a stock RestoreRamDisk has.
+pub const MKFS_ID: &str = "newfs_apfs (2142.41.2.100.2)";
+pub const KEXT_ID: &str = "apfs_kext (2142.41.2.100.2)";
 pub const APFS_MIN_USER_INO: u64 = 1004;
 pub const APFS_MIN_DOC_ID: u32 = 16;
 
 const M: u64 = 0xFFFF_FFFF;
 const IP_BM_TX_MULTIPLIER: u32 = 16;
 const IP_BM_INDEX_INVALID: u16 = 0xFFFF;
-const BITMAP_XID_OFF: usize = 0x150;
+// Version-1 ("versioned") spaceman: the internal-pool arrays start at 0x9D8 (2520), after a
+// 2184-byte (0x888) datazone, not at 0x150 (336). iOS's apfs mounts the RestoreRamDisk
+// read-write and, on a version-0 spaceman, runs spaceman_upgrade_sm_version_0_to_1 — a write
+// during the ramdisk mount that fails and drops the device to Recovery. newfs_apfs emits v1
+// directly; apfs-writer now does too. (Confirmed by RE of apfs 2811.160.7 sub_FFFFFFF009BE042C.)
+const SM_DATAZONE_LEN: usize = 0x888; // 2184
+const BITMAP_XID_OFF: usize = 0x150 + SM_DATAZONE_LEN; // 0x9D8 = 2520
 
-fn div_round_up(n: u64, d: u64) -> u64 {
+pub(crate) fn div_round_up(n: u64, d: u64) -> u64 {
     (n + d - 1) / d
 }
-fn round_up8(x: usize) -> usize {
+pub(crate) fn round_up8(x: usize) -> usize {
     (x + 7) & !7
 }
 fn u16le(v: u16) -> [u8; 2] {
@@ -98,16 +114,16 @@ fn u32le(v: u32) -> [u8; 4] {
 fn u64le(v: u64) -> [u8; 8] {
     v.to_le_bytes()
 }
-fn put16(b: &mut [u8], off: usize, v: u16) {
+pub(crate) fn put16(b: &mut [u8], off: usize, v: u16) {
     b[off..off + 2].copy_from_slice(&u16le(v));
 }
-fn put32(b: &mut [u8], off: usize, v: u32) {
+pub(crate) fn put32(b: &mut [u8], off: usize, v: u32) {
     b[off..off + 4].copy_from_slice(&u32le(v));
 }
-fn put64(b: &mut [u8], off: usize, v: u64) {
+pub(crate) fn put64(b: &mut [u8], off: usize, v: u64) {
     b[off..off + 8].copy_from_slice(&u64le(v));
 }
-fn obj_header(b: &mut [u8], oid: u64, xid: u64, otype: u32, subtype: u32) {
+pub(crate) fn obj_header(b: &mut [u8], oid: u64, xid: u64, otype: u32, subtype: u32) {
     put64(b, 8, oid);
     put64(b, 16, xid);
     put32(b, 24, otype);
@@ -364,18 +380,79 @@ impl Layout {
     }
 }
 
-/// The ContainerBuilder writes every structure in mkapfs order.
+/// What an entry is. Entries are listed parents-first; the volume root is implicit.
+#[derive(Clone)]
+pub enum EntryKind {
+    Dir,
+    File(Source),
+    Symlink(String),
+    /// A transparently compressed file (decmpfs), stored as the original xattrs.
+    Compressed(Compressed),
+}
+
+/// `FileEntry::size` is the uncompressed size.
+#[derive(Clone)]
+pub struct Compressed {
+    /// Value of `com.apple.decmpfs`.
+    pub decmpfs: Vec<u8>,
+    /// Value of `com.apple.ResourceFork`; empty when the data is inline in `decmpfs`.
+    pub rsrc: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub enum Source {
+    Path(PathBuf),
+    Mem(Vec<u8>),
+}
+
 #[derive(Clone)]
 pub struct FileEntry {
-    pub name: String,
-    pub data: Vec<u8>,
+    /// Path relative to the volume root, `/`-separated, no leading slash.
+    pub path: String,
+    pub kind: EntryKind,
+    /// Permission bits only (`0o7777`); the file type comes from `kind`.
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub mtime_ns: u64,
+    /// Content length of a `File`.
+    pub size: u64,
+}
+
+impl FileEntry {
+    pub fn file_mem(path: &str, data: Vec<u8>) -> Self {
+        FileEntry { path: path.into(), mode: 0o644, uid: 0, gid: 0, mtime_ns: 0, size: data.len() as u64, kind: EntryKind::File(Source::Mem(data)) }
+    }
+
+    fn name(&self) -> &str {
+        self.path.rsplit('/').next().unwrap()
+    }
+
+    fn parent(&self) -> &str {
+        self.path.rsplit_once('/').map_or("", |p| p.0)
+    }
+
+    fn data_blocks(&self) -> u64 {
+        match &self.kind {
+            EntryKind::File(_) => div_round_up(self.size, BLOCK_SIZE as u64),
+            EntryKind::Compressed(c) => div_round_up(c.rsrc.len() as u64, BLOCK_SIZE as u64),
+            _ => 0,
+        }
+    }
+
+    fn type_bits(&self) -> u16 {
+        match self.kind {
+            EntryKind::Dir => 0x4000,
+            EntryKind::File(_) | EntryKind::Compressed(_) => 0x8000,
+            EntryKind::Symlink(_) => 0xA000,
+        }
+    }
 }
 
 pub struct ContainerBuilder<'a> {
     pub image: &'a mut [u8],
     pub l: Layout,
-    pub files: Vec<FileEntry>,
-    pub file_paddns: Vec<u64>,
+    pub entries: Vec<FileEntry>,
     pub label: String,
     pub nx_uuid: [u8; 16],
     pub vol_uuid: [u8; 16],
@@ -383,9 +460,306 @@ pub struct ContainerBuilder<'a> {
     pub sb_template: Vec<u8>,
     /// Every sealed object written: (first block, block count).
     pub sealed: Vec<(u64, u64)>,
+    /// Physical block of each entry's content (0 when it has none).
+    paddrs: Vec<u64>,
+    /// Block ranges allocated past the internal pool: file content and extra tree nodes.
+    allocs: Vec<(u64, u64)>,
+    cursor: u64,
+    next_oid: u64,
+    extra_blocks: u64,
+}
+
+const FIRST_INO: u64 = NEXT_OID_AFTER_MKFS + 16;
+
+#[derive(Clone, Copy)]
+struct InodeExtra {
+    bsd_flags: u32,
+    internal_flags: u64,
+    uncompressed_size: u64,
+}
+
+const NO_RSRC_FORK: u64 = 0x8000;
+const HAS_RSRC_FORK: u64 = 0x4000;
+const HAS_UNCOMPRESSED_SIZE: u64 = 0x40000;
+const UF_COMPRESSED: u32 = 0x20;
+const PLAIN: InodeExtra = InodeExtra { bsd_flags: 0, internal_flags: NO_RSRC_FORK, uncompressed_size: 0 };
+
+/// Object ids of the resource-fork data streams: one per compressed file that has a fork,
+/// numbered after the inodes.
+fn stream_ids(entries: &[FileEntry]) -> Vec<u64> {
+    let mut next = FIRST_INO + entries.len() as u64;
+    entries
+        .iter()
+        .map(|e| match &e.kind {
+            EntryKind::Compressed(c) if !c.rsrc.is_empty() => {
+                next += 1;
+                next - 1
+            }
+            _ => 0,
+        })
+        .collect()
+}
+
+fn cat_spec() -> TreeSpec {
+    TreeSpec { fixed: None, bt_flags: 0x40, storage: OBJ_VIRTUAL, subtype: OBJECT_TYPE_FSTREE, root_oid: FIRST_VOL_CAT_ROOT_OID }
+}
+
+fn extref_spec(root: u64) -> TreeSpec {
+    TreeSpec { fixed: None, bt_flags: 0x10 | 0x40, storage: OBJ_PHYSICAL, subtype: OBJECT_TYPE_BLOCKREFTREE, root_oid: root }
+}
+
+fn omap_spec(root: u64) -> TreeSpec {
+    TreeSpec { fixed: Some((16, 16)), bt_flags: 0x10, storage: OBJ_PHYSICAL, subtype: OBJECT_TYPE_OMAP, root_oid: root }
+}
+
+fn omap_recs(maps: &[(u64, u64)]) -> Vec<Rec> {
+    maps.iter()
+        .map(|&(oid, paddr)| {
+            let mut k = u64le(oid).to_vec();
+            k.extend(u64le(MKFS_XID));
+            let mut v = u32le(0).to_vec();
+            v.extend(u32le(BLOCK_SIZE as u32));
+            v.extend(u64le(paddr));
+            (k, v)
+        })
+        .collect()
+}
+
+/// Catalog records for the whole volume, sorted in apfsck key order.
+fn catalog_records(entries: &[FileEntry], paddrs: &[u64], ts: u64) -> Vec<Rec> {
+    let drec_key = |parent: u64, name: &str| -> Vec<u8> {
+        let mut k = u64le((9u64 << 60) | parent).to_vec();
+        k.extend(u32le(dentry_hash_standalone(name) | (name.len() + 1) as u32));
+        k.extend(name.bytes());
+        k.push(0);
+        k
+    };
+    let drec_val = |ino: u64, type_bits: u16| -> Vec<u8> {
+        let mut v = u64le(ino).to_vec();
+        v.extend(u64le(ts));
+        v.extend(u16le(type_bits >> 12));
+        v
+    };
+    let ino_key = |ino: u64| u64le((3u64 << 60) | ino).to_vec();
+    #[allow(clippy::too_many_arguments)]
+    let ino_val = |ino: u64, parent: u64, name: &str, mode: u16, nlink: u32, uid: u32, gid: u32, mtime: u64, dstream: Option<(u64, u64)>, x: InodeExtra| -> Vec<u8> {
+        let mut v = u64le(parent).to_vec();
+        v.extend(u64le(ino));
+        for _ in 0..4 {
+            v.extend(u64le(mtime));
+        }
+        v.extend(u64le(x.internal_flags));
+        v.extend(u32le(nlink)); // nchildren for directories
+        v.extend(u32le(0)); // default_protection_class
+        v.extend(u32le(0)); // write gen
+        v.extend(u32le(x.bsd_flags));
+        v.extend(u32le(uid));
+        v.extend(u32le(gid));
+        v.extend(u16le(mode));
+        v.extend(u16le(0)); // pad
+        v.extend(u64le(x.uncompressed_size));
+        let mut name_val = name.as_bytes().to_vec();
+        name_val.push(0);
+        let mut xfields = vec![(4u8, 0x02u8, name_val)]; // NAME, DO_NOT_COPY
+        if let Some((size, alloced)) = dstream {
+            let mut d = u64le(size).to_vec();
+            d.extend(u64le(alloced));
+            d.extend([0u8; 24]); // crypto id, bytes written, bytes read
+            xfields.push((8, 0x20, d)); // DSTREAM, SYSTEM_FIELD
+        }
+        let used: usize = xfields.iter().map(|x| x.2.len().next_multiple_of(8)).sum();
+        v.extend(u16le(xfields.len() as u16));
+        v.extend(u16le(used as u16));
+        for (ty, fl, val) in &xfields {
+            v.push(*ty);
+            v.push(*fl);
+            v.extend(u16le(val.len() as u16));
+        }
+        for (_, _, val) in &xfields {
+            v.extend(val);
+            v.extend(vec![0u8; val.len().next_multiple_of(8) - val.len()]);
+        }
+        v
+    };
+
+    let mut ino_of: HashMap<&str, u64> = HashMap::new();
+    ino_of.insert("", ROOT_DIR_INO);
+    for (i, e) in entries.iter().enumerate() {
+        ino_of.insert(&e.path, FIRST_INO + i as u64);
+    }
+    let mut nchildren: HashMap<u64, u32> = HashMap::new();
+    nchildren.insert(PRIV_DIR_INO, 0);
+    for e in entries {
+        *nchildren.entry(ino_of[e.parent()]).or_default() += 1;
+    }
+
+    let mut recs: Vec<Rec> = vec![];
+    recs.push((drec_key(1, "root"), drec_val(ROOT_DIR_INO, 0x4000)));
+    recs.push((drec_key(1, "private-dir"), drec_val(PRIV_DIR_INO, 0x4000)));
+    recs.push((ino_key(ROOT_DIR_INO), ino_val(ROOT_DIR_INO, 1, "root", 0o755 | 0x4000, nchildren.get(&ROOT_DIR_INO).copied().unwrap_or(0), 0, 0, ts, None, PLAIN)));
+    recs.push((ino_key(PRIV_DIR_INO), ino_val(PRIV_DIR_INO, 1, "private-dir", 0o755 | 0x4000, 0, 0, 0, ts, None, PLAIN)));
+
+    let sids = stream_ids(entries);
+    for (i, e) in entries.iter().enumerate() {
+        let ino = FIRST_INO + i as u64;
+        let parent = ino_of[e.parent()];
+        let mode = e.type_bits() | e.mode;
+        let inode = |nlink: u32, dstream: Option<(u64, u64)>, x: InodeExtra| {
+            (ino_key(ino), ino_val(ino, parent, e.name(), mode, nlink, e.uid, e.gid, e.mtime_ns, dstream, x))
+        };
+        let xattr = |name: &[u8], flags: u16, data: Vec<u8>| {
+            let mut k = u64le((4u64 << 60) | ino).to_vec(); // XATTR
+            k.extend(u16le(name.len() as u16 + 1));
+            k.extend(name);
+            k.push(0);
+            let mut v = u16le(flags).to_vec();
+            v.extend(u16le(data.len() as u16));
+            v.extend(data);
+            (k, v)
+        };
+        // content stream records: DSTREAM_ID (not for xattr streams) and one FILE_EXTENT, owned by `id`
+        let stream = |recs: &mut Vec<Rec>, id: u64, alloced: u64, paddr: u64, dstream_id: bool| {
+            if dstream_id {
+                recs.push((u64le((6u64 << 60) | id).to_vec(), u32le(1).to_vec())); // refcnt 1
+            }
+            let mut k = u64le((8u64 << 60) | id).to_vec();
+            k.extend(u64le(0)); // logical addr
+            let mut v = u64le(alloced).to_vec();
+            v.extend(u64le(paddr));
+            v.extend(u64le(0)); // crypto_id
+            recs.push((k, v));
+        };
+        recs.push((drec_key(parent, e.name()), drec_val(ino, e.type_bits())));
+        match &e.kind {
+            EntryKind::Dir => {
+                let n = nchildren.get(&ino).copied().unwrap_or(0);
+                recs.push(inode(n, None, PLAIN));
+            }
+            EntryKind::File(_) => {
+                let alloced = e.size.next_multiple_of(BLOCK_SIZE as u64);
+                recs.push(inode(1, (e.size > 0).then_some((e.size, alloced)), PLAIN));
+                if e.size > 0 {
+                    stream(&mut recs, ino, alloced, paddrs[i], true);
+                }
+            }
+            EntryKind::Symlink(target) => {
+                recs.push(inode(1, None, PLAIN));
+                let mut data = target.as_bytes().to_vec();
+                data.push(0);
+                recs.push(xattr(b"com.apple.fs.symlink", 0x2 | 0x4, data)); // EMBEDDED | FILE_SYSTEM_OWNED
+            }
+            EntryKind::Compressed(c) => {
+                let fork = if c.rsrc.is_empty() { NO_RSRC_FORK } else { HAS_RSRC_FORK };
+                let x = InodeExtra { bsd_flags: UF_COMPRESSED, internal_flags: fork | HAS_UNCOMPRESSED_SIZE, uncompressed_size: e.size };
+                recs.push(inode(1, None, x));
+                recs.push(xattr(b"com.apple.decmpfs", 0x2, c.decmpfs.clone())); // EMBEDDED
+                if !c.rsrc.is_empty() {
+                    let alloced = (c.rsrc.len() as u64).next_multiple_of(BLOCK_SIZE as u64);
+                    let mut d = u64le(sids[i]).to_vec(); // xattr_dstream: stream id + dstream
+                    d.extend(u64le(c.rsrc.len() as u64));
+                    d.extend(u64le(alloced));
+                    d.extend([0u8; 24]);
+                    recs.push(xattr(b"com.apple.ResourceFork", 0x1, d)); // DATA_STREAM
+                    stream(&mut recs, sids[i], alloced, paddrs[i], false);
+                }
+            }
+        }
+    }
+    recs.sort_by_key(|(k, _)| {
+        let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
+        let (id, ty) = (hdr & 0x0FFF_FFFF_FFFF_FFFF, hdr >> 60);
+        let (number, name) = match ty {
+            9 => (u32::from_le_bytes(k[8..12].try_into().unwrap()) as u64 & !0x3FF, k[12..].to_vec()),
+            8 => (u64::from_le_bytes(k[8..16].try_into().unwrap()), vec![]),
+            4 => (0, k[10..].to_vec()),
+            _ => (0, vec![]),
+        };
+        (id, ty, number, name)
+    });
+    recs
+}
+
+/// One extent-reference record per file with content, owned by its inode.
+fn extref_records(entries: &[FileEntry], paddrs: &[u64]) -> Vec<Rec> {
+    let sids = stream_ids(entries);
+    let mut recs: Vec<Rec> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.data_blocks() > 0)
+        .map(|(i, e)| {
+            let k = u64le((2u64 << 60) | paddrs[i]).to_vec(); // APFS_TYPE_EXTENT
+            let mut v = u64le((1u64 << 60) | e.data_blocks()).to_vec(); // KIND_NEW
+            v.extend(u64le(if sids[i] != 0 { sids[i] } else { FIRST_INO + i as u64 }));
+            v.extend(u32le(1));
+            (k, v)
+        })
+        .collect();
+    recs.sort_by_key(|r| u64::from_le_bytes(r.0[..8].try_into().unwrap()));
+    recs
 }
 
 impl<'a> ContainerBuilder<'a> {
+    /// Plan the layout for `entries` on a `block_count`-block image.
+    pub fn new(
+        image: &'a mut [u8],
+        block_count: u64,
+        label: &str,
+        nx_uuid: [u8; 16],
+        vol_uuid: [u8; 16],
+        timestamp: u64,
+        entries: Vec<FileEntry>,
+    ) -> Result<Self> {
+        let mut seen: HashMap<&str, bool> = HashMap::new();
+        seen.insert("", true);
+        for e in &entries {
+            if !e.path.is_ascii() || e.path.starts_with('/') || e.name().len() > 254 {
+                bail!("unsupported path {:?} (ASCII, relative, names under 255 bytes)", e.path);
+            }
+            match seen.get(e.parent()) {
+                Some(true) => {}
+                _ => bail!("{}: parent directory missing or not a directory", e.path),
+            }
+            if seen.insert(&e.path, matches!(e.kind, EntryKind::Dir)).is_some() {
+                bail!("{}: duplicate path", e.path);
+            }
+        }
+
+        // Node counts depend only on record sizes, so a dry run with zero addresses sizes the trees.
+        let zeros = vec![0u64; entries.len()];
+        let cat_nodes = node_count(&cat_spec(), &catalog_records(&entries, &zeros, timestamp));
+        let ext_nodes = node_count(&extref_spec(0), &extref_records(&entries, &zeros));
+        let omap_nodes = node_count(&omap_spec(0), &omap_recs(&vec![(0, 0); cat_nodes as usize]));
+        let extra_blocks = (cat_nodes - 1) + (ext_nodes - 1) + (omap_nodes - 1);
+        let data_blocks: u64 = entries.iter().map(|e| e.data_blocks()).sum();
+
+        let l = Layout::compute(block_count, data_blocks + extra_blocks);
+        let cursor = l.sm.used_blocks_end.max(l.snap_root + 1);
+        if cursor + data_blocks + extra_blocks > block_count {
+            bail!(
+                "image too small: need {} blocks ({} MiB), have {}",
+                cursor + data_blocks + extra_blocks,
+                (cursor + data_blocks + extra_blocks) * BLOCK_SIZE as u64 >> 20,
+                block_count
+            );
+        }
+        Ok(ContainerBuilder {
+            image,
+            l,
+            entries,
+            label: label.into(),
+            nx_uuid,
+            vol_uuid,
+            timestamp,
+            sb_template: vec![],
+            sealed: vec![],
+            paddrs: vec![],
+            allocs: vec![],
+            cursor,
+            next_oid: NEXT_OID_AFTER_MKFS,
+            extra_blocks,
+        })
+    }
+
     /// Seal `obj` (one checksum over the whole object) and write it at `bno`.
     fn write_obj(&mut self, bno: u64, obj: &mut [u8]) {
         seal(obj);
@@ -429,65 +803,32 @@ impl<'a> ContainerBuilder<'a> {
         self.write_obj(bno, &mut b);
     }
 
-    /// omap object (mkapfs make_omap_btree).
-    fn make_omap_btree(&mut self, bno: u64, _oid: u64, is_vol: bool) {
-        // root node with one record
-        let (map_oid, map_bno) = if is_vol {
-            (FIRST_VOL_CAT_ROOT_OID, self.l.cat_root)
-        } else {
-            (FIRST_VOL_OID, self.l.first_vol)
-        };
-        let mut root = vec![0u8; BLOCK_SIZE];
-        // mkapfs: toc is exactly min_table_size (112 kvoff slots for omap),
-        // one kvoff entry at the toc start, key right after the toc,
-        // single value at the end of the value area (v = val_len).
-        let toc_len: u16 = 448;
-        put16(&mut root, 0x20, BTNODE_ROOT | BTNODE_LEAF | BTNODE_FIXED_KV_SIZE);
-        put16(&mut root, 0x22, 0); // level
-        put32(&mut root, 0x24, 1); // nkeys
-        put16(&mut root, 0x28, 0); // table_space.off
-        put16(&mut root, 0x2a, toc_len); // table_space.len
-        // kvoff[0] @0x38: k = 0 (first key), v = 16 (value length)
-        put16(&mut root, 0x38, 0);
-        put16(&mut root, 0x3a, 16);
-        // key {ok_oid, ok_xid} right after the toc
-        let key_off = 0x38 + toc_len as usize;
-        put64(&mut root, key_off, map_oid);
-        put64(&mut root, key_off + 8, MKFS_XID);
-        // value {ov_flags=0, ov_size=blocksize, ov_paddr=map_bno} at 4096-40-16
-        let voff = BLOCK_SIZE - 40 - 16;
-        put32(&mut root, voff, 0);
-        put32(&mut root, voff + 4, BLOCK_SIZE as u32);
-        put64(&mut root, voff + 8, map_bno);
-        let free_off = key_off + 16;
-        put16(&mut root, 0x2c, (free_off - key_off) as u16);
-        put16(&mut root, 0x2e, (BLOCK_SIZE - 40 - 16 - free_off) as u16);
-        put16(&mut root, 0x30, BTOFF_INVALID);
-        put16(&mut root, 0x34, BTOFF_INVALID);
-        // btree_info: bt_flags=PHYSICAL; node_size=4096; key_size=16; val_size=16
-        let off = BLOCK_SIZE - 40;
-        put32(&mut root, off, 0x10);
-        put32(&mut root, off + 4, BLOCK_SIZE as u32);
-        put32(&mut root, off + 8, 16);
-        put32(&mut root, off + 12, 16);
-        put32(&mut root, off + 16, 16);
-        put32(&mut root, off + 20, 16);
-        put64(&mut root, off + 24, 1);
-        put64(&mut root, off + 32, 1);
-        obj_header(&mut root, bno + 1, MKFS_XID, OBJ_PHYSICAL | OBJECT_TYPE_BTREE, OBJECT_TYPE_OMAP);
-        self.write_obj(bno + 1, &mut root);
-
-        // omap object block
+    /// omap object (mkapfs make_omap_btree): object at `bno`, tree root at `bno + 1`,
+    /// further tree nodes allocated past the internal pool.
+    fn make_omap_btree(&mut self, bno: u64, maps: &[(u64, u64)]) {
+        let recs = omap_recs(maps);
+        let spec = omap_spec(bno + 1);
+        let nodes = build_tree(&spec, &recs, &mut || self.alloc(1));
+        for n in nodes {
+            let mut data = n.data;
+            self.write_obj(n.oid, &mut data);
+        }
         let mut om = vec![0u8; BLOCK_SIZE];
         obj_header(&mut om, bno, MKFS_XID, OBJ_PHYSICAL | OBJECT_TYPE_OMAP, 0);
-        put32(&mut om, 32, if is_vol { 0 } else { 0x1 }); // om_flags: MANUALLY_MANAGED for container
+        put32(&mut om, 32, if bno == self.l.main_omap { 0x1 } else { 0 }); // om_flags: MANUALLY_MANAGED for container
         put32(&mut om, 36, 0); // om_snap_count
         put32(&mut om, 40, OBJ_PHYSICAL | OBJECT_TYPE_BTREE); // om_tree_type
         put32(&mut om, 44, OBJ_PHYSICAL | OBJECT_TYPE_BTREE); // om_snapshot_tree_type
-        put64(&mut om, 48, bno + 1); // om_tree_oid: root is the next block
-        put64(&mut om, 56, 0); // om_snapshot_tree_oid
-        put64(&mut om, 64, 0); // om_most_recent_snap
+        put64(&mut om, 48, bno + 1); // om_tree_oid
         self.write_obj(bno, &mut om);
+    }
+
+    /// Reserve `n` contiguous blocks past the internal pool.
+    fn alloc(&mut self, n: u64) -> u64 {
+        let start = self.cursor;
+        self.cursor += n;
+        self.allocs.push((start, n));
+        start
     }
 
     /// Volume superblock (mkapfs make_volume).
@@ -497,14 +838,13 @@ impl<'a> ContainerBuilder<'a> {
         put32(&mut b, 0x20, FS_MAGIC);
         put32(&mut b, 0x24, 0); // fs_index
         put64(&mut b, 0x28, 0x2); // features: HARDLINK_MAP_RECORDS
-        put64(&mut b, 0x38, 0x1); // incompatible: CASE_INSENSITIVE (norm-insensitive)
+        put64(&mut b, 0x38, 0x8); // incompatible: NORMALIZATION_INSENSITIVE only (case-sensitive), as iOS volumes
         // meta_crypto @0x60: wmcs
         put16(&mut b, 0x60, 5); // major
         put16(&mut b, 0x62, 0); // minor
         put32(&mut b, 0x64, 0); // cpflags
         put32(&mut b, 0x68, 6); // persistent_class = PROTECTION_CLASS_F
         put16(&mut b, 0x70, 1); // key_revision
-        put64(&mut b, 0xB0, APFS_MIN_USER_INO);
         b[0xF0..0x100].copy_from_slice(&self.vol_uuid); // vol_uuid (16)
         put64(&mut b, 0x108, 0x1); // fs_flags: UNENCRYPTED
         // formatted_by @0x110: id[32]+timestamp u64+last_xid u64
@@ -512,6 +852,13 @@ impl<'a> ContainerBuilder<'a> {
         b[0x110..0x110 + id.len()].copy_from_slice(id);
         put64(&mut b, 0x130, self.timestamp);
         put64(&mut b, 0x138, MKFS_XID);
+        // apfs_modified_by[0] @0x140: the kext mount stamp a real (mounted) volume carries.
+        let kext = KEXT_ID.as_bytes();
+        b[0x140..0x140 + kext.len()].copy_from_slice(kext);
+        put64(&mut b, 0x160, self.timestamp);
+        put64(&mut b, 0x168, MKFS_XID);
+        // apfs_fext_tree_type @0x410: newfs_apfs sets the type (OBJ_PHYSICAL|BTREE) even with no tree.
+        put32(&mut b, 0x410, OBJ_PHYSICAL | OBJECT_TYPE_BTREE);
         // volname @0x2C0
         let name = self.label.as_bytes();
         b[0x2C0..0x2C0 + name.len()].copy_from_slice(name);
@@ -524,210 +871,45 @@ impl<'a> ContainerBuilder<'a> {
         put64(&mut b, 0x88, FIRST_VOL_CAT_ROOT_OID); // virtual oid -> vol omap
         put64(&mut b, 0x90, l.extref_root); // physical tree
         put64(&mut b, 0x98, l.snap_root); // physical tree
-        let file_blocks: u64 = self.files.iter().map(|f| div_round_up(f.data.len() as u64, BLOCK_SIZE as u64)).sum();
-        put64(&mut b, 0x58, 5 + file_blocks); // fs_alloc_count: 4 roots + omap + file data
-        put64(&mut b, 0xB8, self.files.len() as u64); // num_files
-        put64(&mut b, 0xB0, NEXT_OID_AFTER_MKFS + 16 + self.files.len() as u64); // next_obj_id
+        let count = |f: fn(&EntryKind) -> bool| self.entries.iter().filter(|e| f(&e.kind)).count() as u64;
+        let data_blocks: u64 = self.entries.iter().map(|e| e.data_blocks()).sum();
+        // 5 fixed tree objects (omap, omap root, catalog, extref, snapshot-meta) plus content and extra nodes
+        put64(&mut b, 0x58, 5 + data_blocks + self.extra_blocks); // fs_alloc_count
+        put64(&mut b, 0xB0, stream_ids(&self.entries).iter().max().map_or(0, |m| *m).max(FIRST_INO + self.entries.len() as u64 - 1) + 1); // next_obj_id (inode numbers)
+        put64(&mut b, 0xB8, count(|k| matches!(k, EntryKind::File(_) | EntryKind::Compressed(_)))); // num_files
+        put64(&mut b, 0xC0, count(|k| matches!(k, EntryKind::Dir))); // num_directories
+        put64(&mut b, 0xC8, count(|k| matches!(k, EntryKind::Symlink(_)))); // num_symlinks
         obj_header(&mut b, FIRST_VOL_OID, MKFS_XID, OBJ_VIRTUAL | OBJECT_TYPE_FS, 0);
         self.write_obj(l.first_vol, &mut b);
     }
 
-    fn crc32c(&self, mut crc: u32, data: &[u8]) -> u32 {
-        // reflected CRC32C (Castagnoli), no final xor - matches apfsprogs
-        let table = crc32c_table();
-        for &byte in data {
-            crc = table[((crc ^ (byte as u32)) & 0xff) as usize] ^ (crc >> 8);
-        }
-        crc
-    }
-
-    /// dentry hash: crc32c over each name char as a little-endian u32
-    pub fn dentry_hash(&self, name: &str) -> u32 {
-        let mut hash: u32 = 0xFFFFFFFF;
-        for c in name.chars() {
-            let utf32 = (c as u32).to_le_bytes();
-            hash = self.crc32c(hash, &utf32);
-        }
-        (hash & 0x3FFFFF) << 10
-    }
-
-    /// Build all catalog records: 4 special dir records + file records.
-    fn catalog_records(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut recs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-        // case-insensitive volume -> hashed drec keys
-        let drec_key = |parent: u64, name: &str| -> Vec<u8> {
-            let mut k = vec![];
-            k.extend(u64le((9u64 << 60) | parent)); // DIR_REC
-            let hash = self.dentry_hash(name);
-            k.extend(u32le(hash | (name.len() + 1) as u32)); // hash already shifted; len in low 10 bits
-            k.extend(name.bytes());
-            k.push(0);
-            k
-        };
-        let drec_val = |ino: u64, mode: u16| -> Vec<u8> {
-            let mut v = vec![];
-            v.extend(u64le(ino));
-            v.extend(u64le(self.timestamp));
-            v.extend(u16le(mode >> 12)); // dentry type = S_IFMT bits
-            v
-        };
-        let ino_key = |ino: u64| -> Vec<u8> {
-            let mut k = vec![];
-            k.extend(u64le((3u64 << 60) | ino)); // INODE
-            k
-        };
-        let ino_val = |ino: u64, parent: u64, name: &str, mode: u16, nchildren: u32, dstream: Option<(u64, u64)>| -> Vec<u8> {
-            let mut v = vec![];
-            v.extend(u64le(parent));
-            v.extend(u64le(ino));
-            for _ in 0..4 {
-                v.extend(u64le(self.timestamp));
-            }
-            v.extend(u64le(0x8000)); // internal flags: NO_RSRC_FORK
-            v.extend(u32le(nchildren));
-            v.extend(u32le(0)); // default_protection_class = DIR_NONE
-            v.extend(u32le(0)); // write gen
-            v.extend(u32le(0)); // bsd flags
-            v.extend(u32le(0)); // owner
-            v.extend(u32le(0)); // group
-            v.extend(u16le(mode | 0o400)); // full st_mode: type | perms
-            v.extend(u16le(0)); // pad
-            v.extend(u64le(0)); // uncompressed size
-            // xfields: (type, flags, value); values are zero-padded to 8 bytes
-            let mut name_val = name.as_bytes().to_vec();
-            name_val.push(0);
-            let mut xfields = vec![(4u8, 0x02u8, name_val)]; // NAME, DO_NOT_COPY
-            if let Some((size, alloced)) = dstream {
-                let mut d = vec![];
-                d.extend(u64le(size));
-                d.extend(u64le(alloced));
-                d.extend([0u8; 24]); // crypto id, bytes written, bytes read
-                xfields.push((8, 0x20, d)); // DSTREAM, SYSTEM_FIELD
-            }
-            let used: usize = xfields.iter().map(|x| x.2.len().next_multiple_of(8)).sum();
-            v.extend(u16le(xfields.len() as u16));
-            v.extend(u16le(used as u16));
-            for (ty, fl, val) in &xfields {
-                v.push(*ty);
-                v.push(*fl);
-                v.extend(u16le(val.len() as u16));
-            }
-            for (_, _, val) in &xfields {
-                v.extend(val);
-                v.extend(vec![0u8; val.len().next_multiple_of(8) - val.len()]);
-            }
-            v
-        };
-
-        // special dirs + files; records get sorted by key below (APFS order:
-        // inode records (type 3) < file extents (8) < drecs (9) per parent id)
-        recs.push((drec_key(1, "root"), drec_val(ROOT_DIR_INO, 0x4000)));
-        recs.push((drec_key(1, "private-dir"), drec_val(PRIV_DIR_INO, 0x4000)));
-
-        // files: drec (parent=root dir 2) + inode (parent=2) + one file extent
-        let mut ino = NEXT_OID_AFTER_MKFS + 16;
-        for (idx, f) in self.files.iter().enumerate() {
-            recs.push((drec_key(ROOT_DIR_INO, &f.name), drec_val(ino, 0x8000)));
-            let alloced = f.data.len().next_multiple_of(BLOCK_SIZE) as u64;
-            recs.push((ino_key(ino), ino_val(ino, ROOT_DIR_INO, &f.name, 0o644 | 0x8000, 1, Some((f.data.len() as u64, alloced)))));
-            recs.push((u64le((6u64 << 60) | ino).to_vec(), u32le(1).to_vec())); // DSTREAM_ID, refcnt 1
-            // file extent: type FILE_EXTENT(8), logical_addr 0
-            let mut k = vec![];
-            k.extend(u64le((8u64 << 60) | ino));
-            k.extend(u64le(0)); // logical addr
-            let mut v = vec![];
-            v.extend(u64le(alloced)); // len, flags 0
-            v.extend(u64le(self.file_paddns[idx]));
-            v.extend(u64le(0)); // crypto_id
-            recs.push((k, v));
-            ino += 1;
-        }
-
-        // directory inodes last: nchildren is the count of drecs under each
-        let children = |recs: &[(Vec<u8>, Vec<u8>)], dir: u64| {
-            recs.iter().filter(|(k, _)| k[..8] == u64le((9u64 << 60) | dir)).count() as u32
-        };
-        let (root_n, priv_n) = (children(&recs, ROOT_DIR_INO), children(&recs, PRIV_DIR_INO));
-        recs.push((ino_key(ROOT_DIR_INO), ino_val(ROOT_DIR_INO, 1, "root", 0o755 | 0x4000, root_n, None)));
-        recs.push((ino_key(PRIV_DIR_INO), ino_val(PRIV_DIR_INO, 1, "private-dir", 0o755 | 0x4000, priv_n, None)));
-        recs.sort_by_key(|(k, _)| {
-            let hdr = u64::from_le_bytes(k[0..8].try_into().unwrap());
-            let (id, ty) = (hdr & 0x0FFF_FFFF_FFFF_FFFF, hdr >> 60);
-            let (number, name) = match ty {
-                9 => (u32::from_le_bytes(k[8..12].try_into().unwrap()) as u64 & !0x3FF, k[12..].to_vec()),
-                8 => (u64::from_le_bytes(k[8..16].try_into().unwrap()), vec![]),
-                _ => (0, vec![]),
-            };
-            (id, ty, number, name)
+    /// Catalog tree: root at the fixed block, other nodes get virtual oids mapped in the volume omap.
+    fn make_cat_tree(&mut self) -> Vec<(u64, u64)> {
+        let recs = catalog_records(&self.entries, &self.paddrs, self.timestamp);
+        let mut maps = vec![(FIRST_VOL_CAT_ROOT_OID, self.l.cat_root)];
+        let nodes = build_tree(&cat_spec(), &recs, &mut || {
+            let oid = self.next_oid;
+            self.next_oid += 1;
+            let bno = self.alloc(1);
+            maps.push((oid, bno));
+            oid
         });
-        recs
-    }
-
-    /// Catalog root node built from the record list.
-    fn make_cat_root(&mut self) {
-        let recs = self.catalog_records();
-        self.make_leaf_root(self.l.cat_root, FIRST_VOL_CAT_ROOT_OID, OBJ_VIRTUAL, OBJECT_TYPE_FSTREE, 0x40, &recs);
-    }
-
-    /// Extent-reference tree: one NEW physical extent per file, owned by its inode.
-    fn make_extref_root(&mut self) {
-        let mut recs = vec![];
-        for (idx, f) in self.files.iter().enumerate() {
-            let mut k = vec![];
-            k.extend(u64le((2u64 << 60) | self.file_paddns[idx])); // APFS_TYPE_EXTENT
-            let mut v = vec![];
-            v.extend(u64le((1u64 << 60) | div_round_up(f.data.len() as u64, BLOCK_SIZE as u64))); // KIND_NEW
-            v.extend(u64le(NEXT_OID_AFTER_MKFS + 16 + idx as u64));
-            v.extend(u32le(1));
-            recs.push((k, v));
+        let bno_of: HashMap<u64, u64> = maps.iter().copied().collect();
+        for n in nodes {
+            let mut data = n.data;
+            self.write_obj(bno_of[&n.oid], &mut data);
         }
-        self.make_leaf_root(self.l.extref_root, self.l.extref_root, OBJ_PHYSICAL, OBJECT_TYPE_BLOCKREFTREE, 0x10 | 0x40, &recs);
+        maps.sort();
+        maps
     }
 
-    /// Single root+leaf b-tree node holding `recs` (already sorted).
-    fn make_leaf_root(&mut self, bno: u64, oid: u64, storage: u32, subtype: u32, bt_flags: u32, recs: &[(Vec<u8>, Vec<u8>)]) {
-        let nkeys = recs.len() as u32;
-        let toc_len: u16 = (div_round_up(nkeys as u64 * 8, 8) * 8) as u16;
-
-        let mut b = vec![0u8; BLOCK_SIZE];
-        put16(&mut b, 0x20, BTNODE_ROOT | BTNODE_LEAF);
-        put16(&mut b, 0x22, 0);
-        put32(&mut b, 0x24, nkeys);
-        put16(&mut b, 0x28, 0);
-        put16(&mut b, 0x2a, toc_len);
-        put16(&mut b, 0x30, BTOFF_INVALID);
-        put16(&mut b, 0x34, BTOFF_INVALID);
-
-        let mut key_off = 0x38 + toc_len as usize;
-        let mut val_end = BLOCK_SIZE - 40;
-        let mut longest_k = 0u32;
-        let mut longest_v = 0u32;
-        for (i, (kdata, vdata)) in recs.iter().enumerate() {
-            let eoff = 0x38 + i * 8; // toc starts at header end (table_space.off = 0)
-            put16(&mut b, eoff, (key_off - (0x38 + toc_len as usize)) as u16);
-            put16(&mut b, eoff + 2, kdata.len() as u16);
-            val_end -= vdata.len();
-            // v.off: distance from the value-area end to the value start
-            put16(&mut b, eoff + 4, ((BLOCK_SIZE - 40) - val_end) as u16);
-            put16(&mut b, eoff + 6, vdata.len() as u16);
-            b[key_off..key_off + kdata.len()].copy_from_slice(kdata);
-            b[val_end..val_end + vdata.len()].copy_from_slice(vdata);
-            key_off += kdata.len();
-            longest_k = longest_k.max(kdata.len() as u32);
-            longest_v = longest_v.max(vdata.len() as u32);
+    fn make_extref_tree(&mut self) {
+        let recs = extref_records(&self.entries, &self.paddrs);
+        let nodes = build_tree(&extref_spec(self.l.extref_root), &recs, &mut || self.alloc(1));
+        for n in nodes {
+            let mut data = n.data;
+            self.write_obj(n.oid, &mut data);
         }
-        put16(&mut b, 0x2c, (key_off - (0x38 + toc_len as usize)) as u16);
-        put16(&mut b, 0x2e, (val_end - key_off) as u16);
-        let off = BLOCK_SIZE - 40;
-        put32(&mut b, off, bt_flags);
-        put32(&mut b, off + 4, BLOCK_SIZE as u32); // node size
-        put32(&mut b, off + 16, longest_k);
-        put32(&mut b, off + 20, longest_v);
-        put64(&mut b, off + 24, nkeys as u64);
-        put64(&mut b, off + 32, 1);
-        obj_header(&mut b, oid, MKFS_XID, storage | OBJECT_TYPE_BTREE, subtype);
-        self.write_obj(bno, &mut b);
     }
 
 
@@ -757,9 +939,7 @@ impl<'a> ContainerBuilder<'a> {
             (l.ip_bmap_base, l.sm.ip_bmap_blocks as u64),
             (l.sm.ip_base, l.sm.ip_blocks),
         ];
-        for (f, &paddr) in self.files.iter().zip(&self.file_paddns) {
-            used.push((paddr, div_round_up(f.data.len() as u64, BLOCK_SIZE as u64)));
-        }
+        used.extend(self.allocs.iter().copied());
         for (start, len) in used {
             for b in start..start + len {
                 bmap[(b / 8) as usize] |= 1u8 << (b % 8);
@@ -793,6 +973,10 @@ impl<'a> ContainerBuilder<'a> {
         put32(&mut sm, 324, BITMAP_XID_OFF as u32);
         put32(&mut sm, 328, l.sm.bm_addr_off as u32);
         put32(&mut sm, 332, l.sm.bm_free_next_off as u32);
+        // v1 spaceman header: VERSIONED flag + version + struct_size (= data start, past the datazone).
+        put32(&mut sm, 144, 1); // sm_flags = APFS_SM_FLAG_VERSIONED
+        put32(&mut sm, 336, 1); // sm_version = 1
+        put32(&mut sm, 340, BITMAP_XID_OFF as u32); // sm_struct_size = 0x9D8
 
         for i in 0..l.sm.ip_bm_size {
             put64(&mut sm, BITMAP_XID_OFF + i as usize * 8, MKFS_XID);
@@ -814,6 +998,8 @@ impl<'a> ContainerBuilder<'a> {
         for i in 0..addr_count {
             put64(&mut sm, l.sm.cib_addr_base_off + i as usize * 8, first_addr + i as u64);
         }
+        // sm_dev[1].sm_addr_offset: newfs_apfs points it just past device 0's cib addresses.
+        put32(&mut sm, 128, (l.sm.cib_addr_base_off + addr_count as usize * 8) as u32);
 
         // chunk info blocks
         for cib in 0..l.sm.cib_count {
@@ -924,25 +1110,40 @@ impl<'a> ContainerBuilder<'a> {
         Ok(())
     }
 
-    /// Write file content blocks and record their physical locations.
-    /// Data blocks carry no checksum (plain content in APFS).
-    fn place_files(&mut self) -> u64 {
-        let mut cursor = self.l.sm.used_blocks_end.max(self.l.snap_root + 1);
-        for f in &self.files {
-            let paddr = cursor;
-            let nblocks = div_round_up(f.data.len() as u64, BLOCK_SIZE as u64);
+    /// Allocate and write file content; records each entry's first block.
+    fn place_files(&mut self) -> Result<()> {
+        for i in 0..self.entries.len() {
+            let n = self.entries[i].data_blocks();
+            if n == 0 {
+                self.paddrs.push(0);
+                continue;
+            }
+            let paddr = self.alloc(n);
             let off = paddr as usize * BLOCK_SIZE;
-            self.image[off..off + f.data.len()].copy_from_slice(&f.data);
-            self.file_paddns.push(paddr);
-            cursor += nblocks;
+            let e = &self.entries[i];
+            let len = match &e.kind {
+                EntryKind::Compressed(c) => c.rsrc.len(),
+                _ => e.size as usize,
+            };
+            let dst = &mut self.image[off..off + len];
+            match &e.kind {
+                EntryKind::Compressed(c) => dst.copy_from_slice(&c.rsrc),
+                EntryKind::File(Source::Mem(d)) => dst.copy_from_slice(d),
+                EntryKind::File(Source::Path(p)) => {
+                    use std::io::Read;
+                    std::fs::File::open(p)?.read_exact(dst).map_err(|err| anyhow::anyhow!("{}: {err}", p.display()))?
+                }
+                _ => unreachable!(),
+            }
+            self.paddrs.push(paddr);
         }
-        cursor
+        Ok(())
     }
 
     /// Build the whole container image.
     pub fn build(&mut self) -> Result<()> {
         let l = self.l; // Layout is Copy
-        self.place_files();
+        self.place_files()?;
         let mut sb = vec![0u8; BLOCK_SIZE];
         put32(&mut sb, 32, NX_MAGIC);
         put32(&mut sb, 36, BLOCK_SIZE as u32);
@@ -978,20 +1179,18 @@ impl<'a> ContainerBuilder<'a> {
 
         // ephemeral objects (data area)
         self.make_reaper();
-        self.make_spaceman();
         self.make_empty_btree_root(l.ip_fq_bno, IP_FREE_QUEUE_OID, OBJECT_TYPE_SPACEMAN_FREE_QUEUE, true);
         self.make_empty_btree_root(l.main_fq_bno, MAIN_FREE_QUEUE_OID, OBJECT_TYPE_SPACEMAN_FREE_QUEUE, true);
 
-        // container omap (root at main_omap, object at main_omap... mkapfs: omap object @ bno, root @ bno+1)
-        self.make_omap_btree(l.main_omap, l.main_omap, false);
-        // NOTE: mkapfs writes omap object at MAIN_OMAP_BNO and root at MAIN_OMAP_ROOT_BNO
-        self.make_omap_btree(l.vol_omap, l.vol_omap, true);
-
-        // volume + its trees
-        self.make_volume();
-        self.make_cat_root();
-        self.make_extref_root();
+        // volume trees; the omaps come last because they map every tree node allocated above
+        let vol_maps = self.make_cat_tree();
+        self.make_extref_tree();
         self.make_empty_btree_root(l.snap_root, l.snap_root, OBJECT_TYPE_SNAPMETATREE, false);
+        put64(&mut self.sb_template, 88, self.next_oid); // virtual node oids are container oids
+        self.make_omap_btree(l.main_omap, &[(FIRST_VOL_OID, l.first_vol)]);
+        self.make_omap_btree(l.vol_omap, &vol_maps);
+        self.make_volume();
+        self.make_spaceman();
 
         // checkpoint + block 0
         self.make_checkpoint()?;
