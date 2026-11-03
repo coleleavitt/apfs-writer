@@ -2,6 +2,7 @@
 //! Layout, oids, checkpoint semantics and spaceman follow mkapfs exactly;
 //! block checksums follow Apple's newfs_apfs (kuna-verified, 233/233 blocks).
 
+use crate::image::Image;
 use crate::tree::{build_tree, node_count, Rec, TreeSpec};
 use anyhow::{bail, Result};
 use std::collections::HashMap;
@@ -462,7 +463,7 @@ impl FileEntry {
 }
 
 pub struct ContainerBuilder<'a> {
-    pub image: &'a mut [u8],
+    pub image: &'a mut Image,
     pub l: Layout,
     pub entries: Vec<FileEntry>,
     pub label: String,
@@ -711,9 +712,10 @@ fn extref_records(entries: &[FileEntry], paddrs: &[u64]) -> Vec<Rec> {
 }
 
 impl<'a> ContainerBuilder<'a> {
-    /// Plan the layout for `entries` on a `block_count`-block image.
+    /// Plan the layout for `entries` on a `block_count`-block image. `image` must hold at least
+    /// `block_count` blocks; write it out with [`Image::write_to`] after [`build`](Self::build).
     pub fn new(
-        image: &'a mut [u8],
+        image: &'a mut Image,
         block_count: u64,
         label: &str,
         nx_uuid: [u8; 16],
@@ -721,6 +723,9 @@ impl<'a> ContainerBuilder<'a> {
         timestamp: u64,
         entries: Vec<FileEntry>,
     ) -> Result<Self> {
+        if image.len() < block_count * BLOCK_SIZE as u64 {
+            bail!("image is {} bytes, smaller than {block_count} blocks", image.len());
+        }
         let mut seen: HashMap<&str, bool> = HashMap::new();
         seen.insert("", true);
         for e in &entries {
@@ -776,7 +781,7 @@ impl<'a> ContainerBuilder<'a> {
     fn write_obj(&mut self, bno: u64, obj: &mut [u8]) {
         seal(obj);
         let off = bno as usize * BLOCK_SIZE;
-        self.image[off..off + obj.len()].copy_from_slice(obj);
+        self.image.bytes_mut(off, obj.len()).copy_from_slice(obj);
         self.sealed.push((bno, (obj.len() / BLOCK_SIZE) as u64));
     }
 
@@ -1068,11 +1073,11 @@ impl<'a> ContainerBuilder<'a> {
         self.write_obj(l.spaceman_bno, &mut sm);
 
         let off = l.sm.first_chunk_bmap as usize * BLOCK_SIZE;
-        self.image[off..off + bmap.len()].copy_from_slice(&bmap);
+        self.image.bytes_mut(off, bmap.len()).copy_from_slice(&bmap);
 
         // internal pool bitmap (mkapfs make_ip_bitmap)
         let ip_off = l.ip_bmap_base as usize * BLOCK_SIZE;
-        self.image[ip_off..ip_off + l.sm.ip_bm_size as usize * BLOCK_SIZE].fill(0);
+        self.image.bytes_mut(ip_off, l.sm.ip_bm_size as usize * BLOCK_SIZE).fill(0);
         let ip_used = [
             (l.sm.first_chunk_bmap, l.sm.used_chunks_end),
             (l.sm.first_cib, l.sm.cib_count as u64),
@@ -1080,7 +1085,7 @@ impl<'a> ContainerBuilder<'a> {
         ];
         for (start, len) in ip_used {
             for b in start - l.sm.ip_base..start - l.sm.ip_base + len {
-                self.image[ip_off + (b / 8) as usize] |= 1u8 << (b % 8);
+                self.image.bytes_mut(ip_off + (b / 8) as usize, 1)[0] |= 1u8 << (b % 8);
             }
         }
 
@@ -1145,7 +1150,7 @@ impl<'a> ContainerBuilder<'a> {
                 EntryKind::Compressed(c) => c.rsrc.len(),
                 _ => e.size as usize,
             };
-            let dst = &mut self.image[off..off + len];
+            let dst = self.image.bytes_mut(off, len);
             match &e.kind {
                 EntryKind::Compressed(c) => dst.copy_from_slice(&c.rsrc),
                 EntryKind::File(Source::Mem(d)) => dst.copy_from_slice(d),

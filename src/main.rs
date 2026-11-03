@@ -1,4 +1,8 @@
+#![forbid(unsafe_code)]
+
 use apfs_writer::builder::{verify, ContainerBuilder, FileEntry};
+use apfs_writer::Image;
+use std::os::unix::fs::FileExt;
 
 /// Demo: a small container with one file. See `apfs-pack` for real images.
 fn main() -> anyhow::Result<()> {
@@ -9,9 +13,7 @@ fn main() -> anyhow::Result<()> {
     };
     let hello = b"Hello from the Rust APFS writer!\n".to_vec();
 
-    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path)?;
-    file.set_len(block_count * 4096)?;
-    let mut image = unsafe { memmap2::MmapMut::map_mut(&file)? };
+    let mut image = Image::new(block_count * 4096);
     let sealed = {
         let mut cb = ContainerBuilder::new(
             &mut image,
@@ -25,8 +27,16 @@ fn main() -> anyhow::Result<()> {
         cb.build()?;
         cb.sealed
     };
-    image.flush()?;
-    let ok = sealed.iter().filter(|&&(bno, n)| verify(&image[bno as usize * 4096..(bno + n) as usize * 4096])).count();
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path)?;
+    image.write_to(&file)?;
+
+    // Check the objects as written to disk, not the in-memory copy.
+    let mut ok = 0;
+    for &(bno, n) in &sealed {
+        let mut obj = vec![0u8; n as usize * 4096];
+        file.read_exact_at(&mut obj, bno * 4096)?;
+        ok += verify(&obj) as usize;
+    }
     println!("wrote {path}; checksummed objects: {ok} ok, {} bad", sealed.len() - ok);
     Ok(())
 }

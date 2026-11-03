@@ -1,7 +1,11 @@
 //! apfs-pack: build an APFS image from directory trees and tarballs (later sources override earlier ones).
 
+#![forbid(unsafe_code)]
+
 use anyhow::{bail, Context, Result};
 use apfs_writer::builder::{verify, Compressed, ContainerBuilder, EntryKind, FileEntry, Source};
+use apfs_writer::Image;
+use std::os::unix::fs::FileExt;
 use clap::Parser;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -216,9 +220,7 @@ fn main() -> Result<()> {
     eprintln!("{nf} files ({nc} compressed, {} MiB uncompressed), {nd} dirs, {nl} symlinks, {} skipped", bytes >> 20, tree.skipped);
 
     let block_count = args.size_mb * 1024 * 1024 / 4096;
-    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&args.out)?;
-    file.set_len(block_count * 4096)?;
-    let mut image = unsafe { memmap2::MmapMut::map_mut(&file)? };
+    let mut image = Image::new(block_count * 4096);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64;
     let sealed = {
         let mut cb = ContainerBuilder::new(
@@ -233,8 +235,16 @@ fn main() -> Result<()> {
         cb.build()?;
         cb.sealed
     };
-    image.flush()?;
-    let bad = sealed.iter().filter(|&&(b, n)| !verify(&image[b as usize * 4096..(b + n) as usize * 4096])).count();
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&args.out)?;
+    image.write_to(&file).with_context(|| format!("writing {}", args.out.display()))?;
+
+    // Check the objects as written to disk, not the in-memory copy.
+    let mut bad = 0;
+    for &(b, n) in &sealed {
+        let mut obj = vec![0u8; n as usize * 4096];
+        file.read_exact_at(&mut obj, b * 4096)?;
+        bad += !verify(&obj) as usize;
+    }
     if bad > 0 {
         bail!("{bad} of {} sealed objects fail their checksum", sealed.len());
     }

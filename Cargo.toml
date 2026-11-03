@@ -8,8 +8,10 @@ description = "Minimal APFS container/volume writer for iOS restore ramdisks (Li
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
-memmap2 = "0.9.12"
 tar = "0.4"
 flate2 = "1"
 libc = "0.2"
 xattr = "1.7"
+
+[dev-dependencies]
+sha2 = "0.10"
