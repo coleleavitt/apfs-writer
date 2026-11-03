@@ -4,7 +4,6 @@ use anyhow::{bail, Context, Result};
 use apfs_writer::builder::{verify, Compressed, ContainerBuilder, EntryKind, FileEntry, Source};
 use clap::Parser;
 use std::collections::BTreeMap;
-use std::ffi::CString;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -35,34 +34,17 @@ struct Args {
     keep_owner: bool,
 }
 
-/// Full value of an extended attribute, or `None` when absent.
+/// Full value of an extended attribute, or `None` when absent. Does not follow symlinks
+/// (`lgetxattr`).
 fn xattr(path: &Path, name: &str) -> Result<Option<Vec<u8>>> {
-    use std::os::unix::ffi::OsStrExt;
-    let p = CString::new(path.as_os_str().as_bytes())?;
-    let n = CString::new(name)?;
-    // SAFETY: both pointers are valid NUL-terminated strings; a null buffer with size 0 queries the length.
-    let len = unsafe { libc::lgetxattr(p.as_ptr(), n.as_ptr(), std::ptr::null_mut(), 0) };
-    if len < 0 {
-        let err = std::io::Error::last_os_error();
-        // ENODATA: no such xattr. ENOTSUP/EOPNOTSUPP: the name has no Linux xattr namespace
-        // (`com.apple.*` is only valid on macOS), so it cannot exist on a Linux source tree.
-        return match err.raw_os_error() {
-            Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(None),
-            _ => Err(err.into()),
-        };
+    match xattr::get(path, name) {
+        // `xattr::get` already maps ENODATA (no such attribute) to `Ok(None)`.
+        Ok(value) => Ok(value),
+        // ENOTSUP/EOPNOTSUPP: the name has no Linux xattr namespace (`com.apple.*` is only valid
+        // on macOS), so it cannot exist on a Linux source tree.
+        Err(err) if err.raw_os_error() == Some(libc::ENOTSUP) => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("{}: reading xattr {name}", path.display())),
     }
-    let mut buf = vec![0u8; len as usize];
-    // SAFETY: `buf` holds `len` writable bytes.
-    let got = unsafe { libc::lgetxattr(p.as_ptr(), n.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-    if got < 0 {
-        let err = std::io::Error::last_os_error();
-        return match err.raw_os_error() {
-            Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(None),
-            _ => Err(err.into()),
-        };
-    }
-    buf.truncate(got as usize);
-    Ok(Some(buf))
 }
 
 /// decmpfs header: "fpmc", algorithm u32, uncompressed size u64.

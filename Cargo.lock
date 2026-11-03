@@ -75,6 +75,7 @@ dependencies = [
  "memmap2",
  "tar",
  "uuid",
+ "xattr",
 ]
 
 [[package]]

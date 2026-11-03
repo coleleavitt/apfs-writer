@@ -68,10 +68,13 @@ pub fn set_object_header(
     o_type: u32,
     subtype: u32,
 ) {
-    let o = ObjPhys { cksum: 0, oid, xid, o_type, o_flags: subtype };
-    block[0..32].copy_from_slice(unsafe {
-        std::slice::from_raw_parts(&o as *const ObjPhys as *const u8, 32)
-    });
+    // obj_phys_t on disk, little-endian: cksum u64 (left zero for sealing), oid u64, xid u64,
+    // o_type u32, o_subtype u32.
+    block[0..8].copy_from_slice(&0u64.to_le_bytes());
+    block[8..16].copy_from_slice(&oid.to_le_bytes());
+    block[16..24].copy_from_slice(&xid.to_le_bytes());
+    block[24..28].copy_from_slice(&o_type.to_le_bytes());
+    block[28..32].copy_from_slice(&subtype.to_le_bytes());
 }
 
 /// Apple fletcher64 (validated against stock ramdisk; see PROJECT.md).
