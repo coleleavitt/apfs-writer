@@ -48,7 +48,19 @@ pub const ROOT_DIR_INO: u64 = 2;
 pub const PRIV_DIR_INO: u64 = 3;
 pub const NEXT_OID_AFTER_MKFS: u64 = 1024 + 100;
 
-pub const MKFS_XID: u64 = 1;
+// The container's current transaction. A real newfs_apfs volume is created in one transaction
+// and then advanced (the kext stamps it on first mount), so a mounted volume always has
+// formatted_by.last_xid < modified_by.last_xid <= container xid. We emitted everything at a
+// single xid=1, which made creation xid == modification xid == container xid — a shape no
+// mounted volume can have. apfsck rejects it ("Volume creation info: transaction is too
+// recent.", super.c check: xid <= v_first_xid), and it is not the formatted-and-mounted shape
+// iOS expects. Emit the current transaction as xid=2 with the volume recorded as created at
+// FORMAT_XID (1), giving the required strictly-increasing chain. (Verified against a macOS
+// newfs_apfs ramdisk: formatted_by.last_xid=2 < modified_by.last_xid=18 <= container xid=19.)
+pub const MKFS_XID: u64 = 2;
+/// The transaction the volume was originally formatted in (formatted_by.last_xid), strictly
+/// less than MKFS_XID so the volume reads as "formatted earlier, mounted now".
+pub const FORMAT_XID: u64 = 1;
 
 /// Dentry hash of a name on a normalization-insensitive, case-sensitive volume. ASCII names only (NFD is the identity there).
 pub fn dentry_hash_standalone(name: &str) -> u32 {
@@ -851,7 +863,7 @@ impl<'a> ContainerBuilder<'a> {
         let id = MKFS_ID.as_bytes();
         b[0x110..0x110 + id.len()].copy_from_slice(id);
         put64(&mut b, 0x130, self.timestamp);
-        put64(&mut b, 0x138, MKFS_XID);
+        put64(&mut b, 0x138, FORMAT_XID); // formatted_by.last_xid: creation txn, < modified/current
         // apfs_modified_by[0] @0x140: the kext mount stamp a real (mounted) volume carries.
         let kext = KEXT_ID.as_bytes();
         b[0x140..0x140 + kext.len()].copy_from_slice(kext);
@@ -859,6 +871,14 @@ impl<'a> ContainerBuilder<'a> {
         put64(&mut b, 0x168, MKFS_XID);
         // apfs_fext_tree_type @0x410: newfs_apfs sets the type (OBJ_PHYSICAL|BTREE) even with no tree.
         put32(&mut b, 0x410, OBJ_PHYSICAL | OBJECT_TYPE_BTREE);
+        // The kext's own new-volume initializer (apfs 2811.160.7 sub_FFFFFFF009C4EE04) also
+        // stamps these tree types on every fresh volume, and a macOS newfs_apfs ramdisk carries
+        // them. Nothing in the mount path reads them (verified across all 2322 decompiled
+        // functions); this is pure format parity. apfsck accepts reserved_type only as
+        // PHYSICAL|BTREE and doesn't check the other two.
+        put32(&mut b, 0x414, OBJ_PHYSICAL | OBJECT_TYPE_BTREE); // reserved_type
+        put32(&mut b, 0x42C, OBJ_VIRTUAL | OBJECT_TYPE_BTREE); // apfs_doc_id_tree_type
+        put32(&mut b, 0x450, OBJ_VIRTUAL | OBJECT_TYPE_BTREE); // apfs_sec_root_tree_type
         // volname @0x2C0
         let name = self.label.as_bytes();
         b[0x2C0..0x2C0 + name.len()].copy_from_slice(name);
