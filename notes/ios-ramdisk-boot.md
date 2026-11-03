@@ -1,7 +1,8 @@
 # Why iOS wouldn't boot an apfs-writer ramdisk (root cause + fix)
 
-**Date:** 2026-11-03 · **Status:** fixed in `src/builder.rs` (`make_volume`/`make_spaceman`),
-device boot re-test pending.
+**Date:** 2026-11-03 · **Status:** two root causes fixed in `src/builder.rs`
+(`make_spaceman` v1 spaceman + `make_volume` transaction-xid chain); apfsck-clean and
+apfs-fuse-mountable; device boot re-test pending. See both root-cause sections below.
 
 ## Symptom
 An SSH ramdisk whose `ramdisk.img4` was built by apfs-writer (via `apfs-pack`) caused iOS
@@ -57,8 +58,124 @@ version + struct_size are set. apfs-pack's output now matches macOS on every one
 `src/builder.rs`: `const BITMAP_XID_OFF = 0x150 + SM_DATAZONE_LEN (0x888)`; `make_spaceman`
 sets `sm_flags@144=1`, `sm_version@336=1`, `sm_struct_size@340=0x9D8`, and `sm_dev[1]@128`.
 
+## Second root cause — degenerate transaction-xid chain (fixed 2026-11-03)
+The spaceman-v1 fix shipped alongside a new `apfs_modified_by[0]` "kext mount" stamp in
+`make_volume` (a real mounted volume carries one; a never-mounted `newfs` shape was suspected
+to be rejected). But that stamp was written with **`last_xid == MKFS_XID == 1`**, the same xid
+as `formatted_by.last_xid` and the container — so the volume claimed it was *created* and
+*mounted* in the very same transaction, a state no real volume can be in.
+
+- **apfsck** rejects it: `Volume creation info: transaction is too recent.`
+  (`apfsck/super.c`: after walking `apfs_modified_by`, it requires the creation xid
+  `formatted_by.last_xid` to be **strictly less** than the smallest modification xid, i.e.
+  `xid <= v_first_xid` ⇒ error.) The old "every Linux validator accepts xid=1" note was only
+  true *before* the `modified_by` stamp existed (empty `modified_by` + `formatted=1` passes);
+  adding the stamp at xid=1 is what broke it.
+- **Ground truth** from a working macOS `newfs_apfs` ramdisk (iPhone12,5 23G90):
+  `formatted_by.last_xid = 2` **<** `modified_by[0].last_xid = 18` **≤** container `nx_xid = 19`.
+  The chain must be strictly increasing.
+
+### Fix
+`src/builder.rs`: current transaction is now **`MKFS_XID = 2`** (was 1), with a new
+**`FORMAT_XID = 1`** used only for `formatted_by.last_xid@0x138`; `modified_by[0].last_xid@0x168`
+stays `MKFS_XID` (2), and the container NXSB is `o_xid=2 / nx_next_xid=3`. Result:
+`formatted(1) < modified(2) = container xid(2)` — the required chain, matching macOS's shape.
+
+Verified: `apfsck -cw`/`-cuw` **clean** on demo + 71680-block (ramdisk size) + 1,048,576-block
+containers; self-check green (`16 ok, 0 bad`); and a realistic 280 MiB rebuild
+(`apfs-pack --image <stock vol> --tar ssh.tar.gz`, 1786 files / 1213 compressed) is apfsck-clean,
+mounts in apfs-fuse, and carries the injected SSH payload
+(`/usr/local/bin/dropbear*`, `/usr/bin/mount_ich`, `/private/etc/dropbear/*host_key`).
+
+## Mount-path RE (full-kext decompile, 2026-11-03)
+Decompiled all 2322 functions of `com.apple.filesystems.apfs` (idalib, 0 failures) and traced
+the RO→RW mount path, to ground the parity claim in code rather than inference:
+- **The apfsck "transaction too recent" check does NOT exist in the kext.** No string, log or
+  panic mentions `modified_by`/`formatted_by`/xid ordering anywhere in the 2322 functions. That
+  check is an apfsck-only sanity rule. So the xid-chain fix is required for `apfsck`-clean and
+  macOS parity, but is **not, by itself, a device mount gate** (don't overclaim it as "the boot
+  fix").
+- **`nx_ro_to_rw` (`sub_FFFFFFF009BA2FF0`)** is the RO→RW transition iOS runs when it mounts the
+  RestoreRamDisk read-write. Its hard gates, each satisfied by our image:
+  1. `nx_readonly_compatible_features` unsupported → "r/w update not allowed". Ours = **0** → OK.
+  2. non-writable nx dev / hibernate unlock → not applicable to a restore ramdisk.
+  3. spaceman version upgrade `sub_FFFFFFF009BE042C`, gated by
+     `(*(sm+144) & 1) == 0 || *(sm+336) == 0` (sm_flags VERSIONED bit / sm_version). Ours =
+     **1 / 1** → the 2184-byte upgrade write is **skipped**. (Same gate also runs from `nx_resize`
+     and the checkpoint/graft path `sub_FFFFFFF009C6D8B8`.)
+  4. then writes the superblock to block 0 and enables temporary checkpoints — needs a valid
+     checkpoint ring + spaceman, which our image has (apfsck-clean, apfs-fuse-mountable).
+- Net: the image clears every gate visible in the mount and RO→RW paths. The one RE-confirmed
+  blocker (spaceman version) is satisfied; nothing else in the kext rejects our shape.
+
+## Gate-by-gate verification against our bytes (2026-11-03)
+Work dir: `target/e2e-rw/` (gitignored). Scripts in `target/e2e-rw/scripts/`.
+- **`nx_check_superblock` (`sub_FFFFFFF009B94C98`) ported line-for-line to Python**
+  (`nx_check_superblock.py`, plus `obj_checksum_verify_phys` `sub_FFFFFFF009B94BA8`). It is the
+  kext's on-disk NXSB validator, called on every checkpoint-ring superblock. It counts rule
+  violations and returns 92 ("Container corruption detected") if any. All NXSB copies pass in
+  the macOS image (all 4 ring copies), the old local image and the fixed image. The port was
+  mutation-tested: corrupting the checksum, `max_file_systems=101`, `next_oid=0x100` and
+  `spaceman_oid=0` are each caught by exactly the matching rule.
+- **Volume-superblock field diff vs macOS, each field cross-referenced in all 2322 functions**
+  (`apsb_diff.py`, `vsb_field_xref.py`, matching `*(fs+192)+OFF`): `formatted_by`/`modified_by`
+  xids, `reserved_type`, `doc_id_tree_type`, `sec_root_tree_type`, `doc_id_index_xid`, `@0x460`
+  are never read; `doc_id_index_flags` only in post-offline-purge cleanup; `@0x468` is
+  `apfs_fixup_flags` (purgeable fixup, 0 = nothing pending); cloneinfo epoch/xid are clone-tracking
+  counters; `unmount_time` is written at unmount. None is a mount gate.
+- **Format parity added** (`make_volume`): `reserved_type@0x414 = PHYSICAL|BTREE`,
+  `doc_id_tree_type@0x42C = VIRTUAL|BTREE`, `sec_root_tree_type@0x450 = VIRTUAL|BTREE`, the
+  values the kext's own new-volume initializer `sub_FFFFFFF009C4EE04` writes. apfsck-clean.
+  Remaining APSB diffs are layout oids and mounted-history state (`key_os_version`, `next_doc_id`,
+  cloneinfo, doc-id index xid/flags, `@0x460`, fixup flags).
+- **Strict kernel RW mount** (`linux-apfs-rw`, `-o loop,readwrite,cknodes`, write a file,
+  umount, then apfsck the result) on the build *before* the tree-type parity change: macOS ✓,
+  old local ✓ (mounts and writes, but stays apfsck "too recent"), fixed ✓ (stays apfsck-clean
+  after the kernel's own transaction). The old local image mounting RW confirms the xid chain is
+  not a mount gate.
+- **Re-run on the final build (with the tree-type parity fields): pass.** The script is
+  `scripts/rw_mount_test.sh`. It must be run from the user's own terminal because sudo
+  credentials are cached per tty. Result: RW mount, write and mkdir OK; `dropbear` and
+  `mount_ich` intact; umount OK. The kernel committed 3 transactions (xid 2→5) and all 4
+  checkpoint-ring superblocks pass the ported `nx_check_superblock`. apfsck stays clean. The
+  kernel stamped its own `modified_by[0]` entry and set `unmount_time`, which is the normal
+  first-mount shape.
+
+## Rebuilt from Apple's stock ramdisk, content parity vs the macOS build (2026-11-03)
+Same steps as `ramdisk_expand.sh` on Linux. Stock `094-95379-094.dmg` was pulled from the 23G90
+IPSW with the `pzb` shim. Then `apfs-pack --size-mb 280 --image <stock> --tar ssh.tar.gz --src
+<restored_external stage>`, and the result was wrapped with the fixed img4-rs (`-A -T rdsk -M IM4M_0x8030`).
+- File tree: identical to the macOS-built ramdisk apart from `.fseventsd/` (the Mac's fsevents
+  journal from mounting it during the build).
+- Content: all 1779 regular files are byte-identical (sha256).
+- Metadata: mode, size and symlink targets are identical. Ownership differs: the 713 entries
+  injected from ssh.tar.gz are `0:0` in ours and `99:99` in the macOS build, an artefact of the
+  Mac pipeline's `-owners off` mount. Apple's stock files are `0:0` in both.
+- `ramdisk.img4`: same total size as the macOS one (293610426), same IM4P header
+  (`rdsk`/`Unknown`), identical IM4M.
+- Staged as `bootchain/d431ap-26.6.2-23G90-macos-e2e`, a copy of the known-good macOS chain with
+  only `ramdisk.img4` replaced.
+
+## Device e2e: PASS (2026-11-03)
+Booted `BOOTCHAIN_NAME=d431ap-26.6.2-23G90-macos-e2e ./boot.sh --no-logo` on the pwned iPhone12,5
+(ECID 0x1210ce2208802e). That is the known-good macOS chain with only the apfs-pack `ramdisk.img4`
+swapped in. iBEC, trustcache, ramdisk, kernel and `bootx` all went through. The phone came up as
+usbmux "ICH_A12+ Ramdisk v1.1" about 3 s later with no fall back to Recovery. SSH over
+`iproxy 2222 22` (root/alpine) gives a root shell on Darwin 25.6.0 RELEASE_ARM64_T8030, and
+`dropbear`, `mount_ich` and `restored_external` are present and owned root:wheel.
+**The custom Linux-built ramdisk is at boot parity with the macOS build.**
+
+Root comes up as `/dev/md0 on / (apfs, local, read-only, journaled, noatime)`. `mount -uw /`
+fails with EPERM. That comes from the kext, not our image: `apfs_mount_upgrade_checks`
+(`sub_FFFFFFF009BFD810`) returns 1 (EPERM, "Updating mount to read/write mode is not allowed")
+when `fs+896` (the fs's mount pointer, set by `handle_mount` on every mount) is set and the mount
+has `MNT_ROOTFS` (0x4000). So no APFS root can be upgraded to read-write on this kernel, and the
+macOS ramdisk behaves the same. Corollary: in this boot path the root ramdisk is never mounted
+read-write, so the original "RW mount ran the v0→v1 spaceman upgrade" theory is not demonstrated
+here. v1 is still what newfs_apfs emits and is correct, but the old failure may have had another cause.
+
 ## Remaining to prove e2e
-Boot test on the device: known-good macOS bootchain with **only** the apfs-pack v1 ramdisk
-swapped in. If it boots to SSH, apfs-writer is at parity for the ramdisk use case. (The xid
-stays 1 — a single-transaction container — which every Linux validator and, per the RE, the
-mount path accept; only the spaceman version gated the mount.)
+Boot test on the device: known-good macOS bootchain with **only** the freshly-rebuilt apfs-pack
+ramdisk (both fixes: v1 spaceman **and** the valid xid chain) swapped in. If it boots to SSH,
+apfs-writer is at parity for the ramdisk use case. Strongest local proxy short of the device:
+a **RW** mount with the strict `linux-apfs-rw` module (RO is already confirmed via apfs-fuse).
